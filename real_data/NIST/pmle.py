@@ -189,7 +189,7 @@ class pMLEGMM(GaussianMixture):
 
     def _fim(self, X):
         n_samples, n_features = X.shape
-        log_prob = np.empty((n_samples, self.n_components))
+        # log_prob = np.empty((n_samples, self.n_components))
         dldmeans = np.empty((n_samples, self.n_components, n_features))
         dldcovs = np.empty(
             (n_samples, self.n_components, n_features, n_features))

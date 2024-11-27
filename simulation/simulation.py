@@ -25,33 +25,119 @@ def robustmedian(
                     [subset_covs[i], subset_covs[j]],
                     [subset_weights[i], subset_weights[j]],
                     ground_distance=ground_distance.split("-")[1],
-                    matrix=True)
-            else:
-                pairwisedist[i, j] = GMM_L2(
-                    [subset_means[i], subset_means[j]],
-                    [subset_covs[i], subset_covs[j]],
-                    [subset_weights[i], subset_weights[j]],
+                    matrix=False,
                 )
+            else:
+                pairwisedist[i, j] = np.sqrt(
+                    GMM_L2(
+                        [subset_means[i], subset_means[j]],
+                        [subset_covs[i], subset_covs[j]],
+                        [subset_weights[i], subset_weights[j]],
+                    ))
     which_GMM = np.argmin(np.quantile(pairwisedist, q=coverage_ratio, axis=1))
     output = [which_GMM, pairwisedist]
 
     return output
 
 
-def ared_threshold(distance_to_center, pairwisedist, which_GMM):
+def ared_threshold(distance_to_center, pairwisedist, which_GMM, m):
     half_of_num_machine = int(distance_to_center.shape[0] // 2)
     indices = np.argsort(distance_to_center)
     sorted_distance = distance_to_center[indices]
-
-    threshold = np.log(distance_to_center.shape[0] / 2) * np.log(
-        np.log(distance_to_center.shape[0]))
-    c_sd = np.sort(pairwisedist[which_GMM])[half_of_num_machine] / 2
-    if (np.sum(sorted_distance > threshold * c_sd) == 0):
+    c_sd = np.sort(pairwisedist[which_GMM])[half_of_num_machine]
+    threshold = np.sqrt(np.log(m / 2) * np.log(np.log(m)) * 2)
+    if np.sum(sorted_distance > threshold * c_sd) == 0:
         truncation = distance_to_center.shape[0]
     else:
         truncation = np.where(sorted_distance > threshold * c_sd)[0][0]
 
     return indices[:truncation]
+
+
+def ccred(means, covs, weights, means_init, covs_init, weights_init):
+    K, D = means_init.shape
+    cost_matrix = GMM_CTD(
+        means=[means, means_init],
+        covs=[covs, covs_init],
+        weights=[weights / n_split, weights_init],
+        ground_distance="KL",
+        matrix=True,
+    )
+    clustering_matrix = (cost_matrix.T == np.min(cost_matrix, 1)).T
+    ccred_means, ccred_covs, ccred_weights = (
+        np.zeros((K, D)),
+        np.zeros((K, D, D)),
+        np.zeros(K),
+    )
+    r_coats = 0
+    indice_lengths = []
+
+    for k in range(K):
+        group_means = means[clustering_matrix[:, k]]
+        group_covs = covs[clustering_matrix[:, k]]
+        local_closest_indices = np.argsort(cost_matrix[clustering_matrix[:, k],
+                                                       k])[:int(n_split // 2)]
+        r_coat = cost_matrix[clustering_matrix[:, k],
+                             k][local_closest_indices[-1]]
+        r_coats += r_coat
+        indice_lengths.append(local_closest_indices.shape[0])
+        # only aggregate 50% for each component
+        ccred_means[k], ccred_covs[k] = barycenter(
+            group_means[local_closest_indices],
+            group_covs[local_closest_indices],
+            weights[clustering_matrix[:, k]][local_closest_indices],
+            mean_init=means_init[k],
+            cov_init=means_init[k],
+            ground_distance="KL",
+        )
+        ccred_weights[k] = np.sum(
+            weights[clustering_matrix[:, k]][local_closest_indices])
+    ccred_weights /= ccred_weights.sum()
+
+    return ccred_means, ccred_covs, ccred_weights, r_coats, indice_lengths
+
+
+def cared(means, covs, weights, means_init, covs_init, weights_init):
+    K, D = means_init.shape
+    n_split = means.shape[0] / K
+    cost_matrix = GMM_CTD(
+        means=[means, means_init],
+        covs=[covs, covs_init],
+        weights=[weights / n_split, weights_init],
+        ground_distance="KL",
+        matrix=True,
+    )
+    clustering_matrix = (cost_matrix.T == np.min(cost_matrix, 1)).T
+    cared_means, cared_covs, cared_weights = (
+        np.zeros((K, D)),
+        np.zeros((K, D, D)),
+        np.zeros(K),
+    )
+
+    for k in range(K):
+        group_means = means[clustering_matrix[:, k]]
+        group_covs = covs[clustering_matrix[:, k]]
+        local_closest_indices = np.argsort(cost_matrix[clustering_matrix[:, k],
+                                                       k])[:int(n_split // 2)]
+        r_coat = cost_matrix[clustering_matrix[:, k],
+                             k][local_closest_indices[-1]]
+        a_coat = r_coat * np.sqrt(
+            np.log(n_split / 2) * np.log(np.log(n_split)) * 2)
+        local_closest_indices = np.where(cost_matrix[clustering_matrix[:, k],
+                                                     k] <= a_coat)
+        cared_means[k], cared_covs[k] = barycenter(
+            group_means[local_closest_indices],
+            group_covs[local_closest_indices],
+            weights[clustering_matrix[:, k]][local_closest_indices],
+            mean_init=means_init[k],
+            cov_init=means_init[k],
+            ground_distance="KL",
+        )
+        cared_weights[k] = np.sum(
+            weights[clustering_matrix[:, k]][local_closest_indices])
+    cared_weights /= cared_weights.sum()
+
+    return cared_means, cared_covs, cared_weights
 
 
 def generate_attack(
@@ -64,45 +150,75 @@ def generate_attack(
     dimension,
     NumMachine,
     seed,
+    failure_type="component",
 ):
     contaminated_label = [np.zeros(NumComp) for _ in range(NumMachine)]
     attacked_means = copy.deepcopy(means)
     attacked_covs = copy.deepcopy(covs)
     attacked_weights = copy.deepcopy(weights)
 
-    if failure_rate != 0:
-        byzantine_machine_number = int(np.floor(failure_rate * NumMachine))
-        rng = np.random.default_rng(seed)
-        # randomly select the Byzantine failure machines or components
-        byzantine_machine_index = rng.choice(NumMachine,
-                                             byzantine_machine_number,
-                                             replace=False)
+    if failure_type == "component":
+        if failure_rate != 0:
+            per_comp_failure_num = int(np.floor(failure_rate * NumMachine))
+            rng = np.random.default_rng(seed)
+            failure_indices = []
+            for k in range(NumComp):
+                # randomly select the Byzantine failure components
+                # The last machine is always Byzantine failure free
+                failure_index = rng.choice(NumMachine - 1,
+                                           per_comp_failure_num,
+                                           replace=False)
+                failure_indices.append(failure_index)
+                # generate attacks
+                for idx in failure_index:
+                    if attack_mode == 1:
+                        attacked_means[idx][k] = rng.normal(0,
+                                                            100,
+                                                            size=dimension)
+                    elif attack_mode == 2:
+                        attacked_covs[idx][k] = generate_random_covariance(
+                            attacked_covs[idx][k], dimension, idx + k)
+                    contaminated_label[idx][k] = 1
+    elif failure_type == "machine":
+        if failure_rate != 0:
+            byzantine_machine_number = int(np.floor(failure_rate * NumMachine))
+            rng = np.random.default_rng(seed)
+            # randomly select the Byzantine failure machines or components
+            byzantine_machine_index = rng.choice(NumMachine,
+                                                 byzantine_machine_number,
+                                                 replace=False)
 
-        # generate attacks
-        for byzantine_machine in byzantine_machine_index:
-            if attack_mode == 1:
-                attacked_means[byzantine_machine] = rng.normal(
-                    0, 100, size=(NumComp, dimension))
-            elif attack_mode == 2:
-                for machine in range(NumComp):
-                    attacked_covs[byzantine_machine][machine] = (
-                        generate_random_covariance(
-                            attacked_covs[byzantine_machine][machine],
-                            dimension, byzantine_machine + machine))
-            elif attack_mode == 3:
-                attacked_weights[byzantine_machine] = rng.dirichlet(
-                    rng.choice(np.arange(10, 20), NumComp))
-            contaminated_label[byzantine_machine] = np.ones(NumComp)
+            # generate attacks
+            for byzantine_machine in byzantine_machine_index:
+                if attack_mode == 1:
+                    attacked_means[byzantine_machine] = rng.normal(
+                        0, 100, size=(NumComp, dimension))
+                elif attack_mode == 2:
+                    for machine in range(NumComp):
+                        attacked_covs[byzantine_machine][machine] = (
+                            generate_random_covariance(
+                                attacked_covs[byzantine_machine][machine],
+                                dimension,
+                                byzantine_machine + machine,
+                            ))
+                elif attack_mode == 3:
+                    attacked_weights[byzantine_machine] = rng.dirichlet(
+                        rng.choice(np.arange(10, 20), NumComp))
+                contaminated_label[byzantine_machine] = np.ones(NumComp)
 
-        # concate the true contanimated label into a numpy array
-        contaminated_label = np.concatenate(contaminated_label)
-        return (
-            attacked_means,
-            attacked_covs,
-            attacked_weights,
-            byzantine_machine_index,
-            contaminated_label,
-        )
+            failure_indices = []
+            for k in range(NumComp):
+                failure_indices.append(byzantine_machine_index)
+
+    # concate the true contanimated label into a numpy array
+    contaminated_label = np.concatenate(contaminated_label)
+    return (
+        attacked_means,
+        attacked_covs,
+        attacked_weights,
+        failure_indices,
+        contaminated_label,
+    )
 
 
 def Simulation(inputs):
@@ -116,7 +232,6 @@ def Simulation(inputs):
     ------ arbitary values randomly and independently generated from a (uni)multivariate normal distribution ------
         attack_mode == 1 --- sending arbitary values of mean vectors of chosen components;
         attack_mode == 2 --- sending arbitary values of covariance matrices of chosen components;
-        attack_mode == 3 --- sending arbitary values of mixing weights of chosen components；
     """
     ground_distance = "KL"
     random_state = inputs[0]
@@ -126,16 +241,13 @@ def Simulation(inputs):
     true_means = inputs[2]
     true_covs = inputs[3]
     true_weights = inputs[4]
-
     K, D, _ = true_covs.shape
-    true_precisions = np.empty((K, D, D))
-    for k, cov in enumerate(true_covs):
-        true_precisions[k, :, :] = np.linalg.inv(cov)
 
     # configurations for Byzantine failures
     save_folder = inputs[5]
     attack_mode = inputs[6]
     n_split = inputs[7]
+    failure_type = inputs[8]
 
     # ------------------------------
     # Sample from true mixture
@@ -156,14 +268,10 @@ def Simulation(inputs):
     print(save_file)
     with open(save_file, "rb") as f:
         output_data = pickle.load(f)
-
     origin_local_means, origin_local_covs, origin_local_weights = output_data[
         "local"]
-    locals2true_W1 = output_data["local2true_W1"]
-    local_ARI = output_data["local_ARI"]
-    local_ll = output_data["local_ll"]
 
-    # for failure_rate in [0.1, 0.4]:
+    # for failure_rate in [0.2]:
     for failure_rate in [0.1, 0.2, 0.3, 0.4]:
         print("---------------", failure_rate, "--------------------")
         # -------------------------------------------------
@@ -185,11 +293,17 @@ def Simulation(inputs):
             D,
             n_split,
             random_state,
+            failure_type=failure_type,
         )
+        failure_machine = np.zeros(n_split)
+        for k in range(K):
+            failure_machine[byzantine_machine_index[k]] = 1
+
+        print("machine level failure {:.3f}".format(failure_machine.sum() /
+                                                    n_split))
         # ------------------------------
         # COAT
         # ------------------------------
-        start_time = time.time()
         which_GMM, pairwisedist = robustmedian(
             local_means,
             local_covs,
@@ -197,40 +311,132 @@ def Simulation(inputs):
             ground_distance="L2",
             coverage_ratio=0.5,
         )
-        coat_time = time.time() - start_time
-        output_data["coat_index"] = which_GMM
-        output_data["coat_time"] = coat_time
-        output_data["coat2true_W1"] = locals2true_W1[which_GMM]
-        output_data["coat_ARI"] = local_ARI[which_GMM]
-        output_data["coat_ll"] = local_ll[which_GMM]
-
         coat_means, coat_covs, coat_weights = (
             local_means[which_GMM],
             local_covs[which_GMM],
             local_weights[which_GMM],
         )
+        coat2true_W1 = GMM_CTD(
+            [coat_means, true_means],
+            [coat_covs, true_covs],
+            [coat_weights, true_weights],
+            "W1",
+        )
+        coat_resp, coat_predicted_label = label_predict(
+            coat_weights,
+            coat_means,
+            coat_covs,
+            GMM_sample,
+            return_resp=True,
+        )
+        coat_ARI = ARI(true_predicted_labels, coat_predicted_label)
+        coat_ll = np.log(coat_resp.sum(1)).sum(0)
 
+        output_data["coat_index"] = which_GMM
+        output_data["coat2true_W1"] = coat2true_W1
+        output_data["coat_ARI"] = coat_ARI
+        output_data["coat_ll"] = coat_ll
+
+        # ------------------------------
+        # Component-wise CRED
+        # ------------------------------
+        optimal_rcoat = np.Inf
+
+        for i in range(n_split):
+            temp_means, temp_covs, temp_weights, r_coats, single_cluster = ccred(
+                np.concatenate(local_means),
+                np.concatenate(local_covs),
+                np.concatenate(local_weights),
+                local_means[i],
+                local_covs[i],
+                local_weights[i],
+            )
+            if r_coats < optimal_rcoat and (1 not in single_cluster):
+                optimal_rcoat = r_coats
+                ccred_means = temp_means
+                ccred_covs = temp_covs
+                ccred_weights = temp_weights
+                optimal_rcoat_machine = i
+
+        ccred2true_W1 = GMM_CTD(
+            [ccred_means, true_means],
+            [ccred_covs, true_covs],
+            [ccred_weights, true_weights],
+            "W1",
+        )
+        ccred_resp, ccred_predicted_label = label_predict(
+            ccred_weights,
+            ccred_means,
+            ccred_covs,
+            GMM_sample,
+            return_resp=True,
+        )
+
+        ccred_ARI = ARI(true_predicted_labels, ccred_predicted_label)
+        ccred_ll = np.log(ccred_resp.sum(1)).sum(0)
+
+        output_data["ccred2true_W1"] = ccred2true_W1
+        output_data["ccred_ARI"] = ccred_ARI
+        output_data["ccred_ll"] = ccred_ll
+
+        # ------------------------------
+        # Component-wise ARED
+        # ------------------------------
+        cared_means, cared_covs, cared_weights = cared(
+            np.concatenate(local_means),
+            np.concatenate(local_covs),
+            np.concatenate(local_weights),
+            local_means[optimal_rcoat_machine],
+            local_covs[optimal_rcoat_machine],
+            local_weights[optimal_rcoat_machine],
+        )
+        cared2true_W1 = GMM_CTD(
+            [cared_means, true_means],
+            [cared_covs, true_covs],
+            [cared_weights, true_weights],
+            "W1",
+        )
+        cared_resp, cared_predicted_label = label_predict(
+            cared_weights,
+            cared_means,
+            cared_covs,
+            GMM_sample,
+            return_resp=True,
+        )
+
+        cared_ARI = ARI(true_predicted_labels, cared_predicted_label)
+        cared_ll = np.log(cared_resp.sum(1)).sum(0)
+
+        output_data["cared2true_W1"] = cared2true_W1
+        output_data["cared_ARI"] = cared_ARI
+        output_data["cared_ll"] = cared_ll
         # ------------------------------
         # CRED
         # ------------------------------
-        start_time = time.time()
         closest_indices = np.argsort(pairwisedist[which_GMM])[:int(n_split //
                                                                    2)]
-        reduced_gmm = GMR_CTD(
-            np.concatenate([local_means[index] for index in closest_indices]),
-            np.concatenate([local_covs[index] for index in closest_indices]),
-            np.concatenate([local_weights[index]
-                            for index in closest_indices]) /
-            closest_indices.shape[0],
-            K,
-            ground_distance=ground_distance,
-            init_method="user",
-            means_init=coat_means,
-            covs_init=coat_covs,
-            weights_init=coat_weights,
-        )
-        reduced_gmm.iterative()
-        cred_time = time.time() - start_time
+        cred_gmr_optimal = np.Inf
+        for i in range(n_split):
+            reduced_gmm_temp = GMR_CTD(
+                np.concatenate(
+                    [local_means[index] for index in closest_indices]),
+                np.concatenate(
+                    [local_covs[index] for index in closest_indices]),
+                np.concatenate(
+                    [local_weights[index]
+                     for index in closest_indices]) / closest_indices.shape[0],
+                K,
+                ground_distance=ground_distance,
+                init_method="user",
+                means_init=local_means[i],
+                covs_init=local_covs[i],
+                weights_init=local_weights[i],
+            )
+            reduced_gmm_temp.iterative()
+            if reduced_gmm_temp.obj < cred_gmr_optimal:
+                cred_gmr_optimal = reduced_gmm_temp.obj
+                reduced_gmm = reduced_gmm_temp
+
         cred_means, cred_covs, cred_weights = (
             reduced_gmm.reduced_means,
             reduced_gmm.reduced_covs,
@@ -253,37 +459,41 @@ def Simulation(inputs):
         cred_ARI = ARI(true_predicted_labels, cred_predicted_label)
         cred_ll = np.log(cred_resp.sum(1)).sum(0)
 
-        output_data["cred_time"] = cred_time
         output_data["cred2true_W1"] = cred2true_W1
         output_data["cred_ARI"] = cred_ARI
-        # output_data["cred"] = (cred_means, cred_covs, cred_weights)
         output_data["cred_ll"] = cred_ll
 
         # ------------------------------
         # ARED
         # ------------------------------
-        start_time = time.time()
         distance_to_center = pairwisedist[which_GMM]
 
         ared_untruncated_indices = ared_threshold(distance_to_center,
-                                                  pairwisedist, which_GMM)
-        model = GMR_CTD(
-            np.concatenate(
-                [local_means[index] for index in ared_untruncated_indices]),
-            np.concatenate(
-                [local_covs[index] for index in ared_untruncated_indices]),
-            np.concatenate(
-                [local_weights[index] for index in ared_untruncated_indices]) /
-            ared_untruncated_indices.shape[0],
-            K,
-            ground_distance=ground_distance,
-            init_method="user",
-            means_init=coat_means,
-            covs_init=coat_covs,
-            weights_init=coat_weights,
-        )
-        model.iterative()
-        ared_time = time.time() - start_time
+                                                  pairwisedist, which_GMM,
+                                                  n_split)
+        ared_gmr_optimal = np.Inf
+
+        for i in range(n_split):
+            model_temp = GMR_CTD(
+                np.concatenate([
+                    local_means[index] for index in ared_untruncated_indices
+                ]),
+                np.concatenate(
+                    [local_covs[index] for index in ared_untruncated_indices]),
+                np.concatenate([
+                    local_weights[index] for index in ared_untruncated_indices
+                ]) / ared_untruncated_indices.shape[0],
+                K,
+                ground_distance=ground_distance,
+                init_method="user",
+                means_init=local_means[i],
+                covs_init=local_covs[i],
+                weights_init=local_weights[i],
+            )
+            model_temp.iterative()
+            if model_temp.obj < ared_gmr_optimal:
+                ared_gmr_optimal = model_temp.obj
+                model = model_temp
         ared_means, ared_covs, ared_weights = (
             model.reduced_means,
             model.reduced_covs,
@@ -306,7 +516,6 @@ def Simulation(inputs):
         ared_ARI = ARI(true_predicted_labels, ared_predicted_label)
         ared_ll = np.log(ared_resp.sum(1)).sum(0)
 
-        output_data["ared_time"] = ared_time
         output_data["ared_2true_W1"] = ared_2true_W1
         output_data["ared_ARI"] = ared_ARI
         output_data["ared"] = (
@@ -318,69 +527,26 @@ def Simulation(inputs):
         output_data["ared_trimmed"] = ared_untruncated_indices
 
         # ------------------------------
-        # GMR without trimming
-        # ------------------------------
-        start_time = time.time()
-        reduced_gmm = GMR_CTD(
-            np.concatenate(local_means),
-            np.concatenate(local_covs),
-            np.concatenate(local_weights) / n_split,
-            K,
-            ground_distance=ground_distance,
-            init_method="user",
-            means_init=coat_means,
-            covs_init=coat_covs,
-            weights_init=coat_weights,
-        )
-        reduced_gmm.iterative()
-        gmr_time = time.time() - start_time
-        gmr_means, gmr_covs, gmr_weights = (
-            reduced_gmm.reduced_means,
-            reduced_gmm.reduced_covs,
-            reduced_gmm.reduced_weights,
-        )
-        gmr2true_W1 = GMM_CTD(
-            [gmr_means, true_means],
-            [gmr_covs, true_covs],
-            [gmr_weights, true_weights],
-            "W1",
-        )
-        gmr_resp, gmr_predicted_label = label_predict(gmr_weights,
-                                                      gmr_means,
-                                                      gmr_covs,
-                                                      GMM_sample,
-                                                      return_resp=True)
-
-        gmr_ARI = ARI(true_predicted_labels, gmr_predicted_label)
-        gmr_ll = np.log(gmr_resp.sum(1)).sum(0)
-
-        output_data["gmr_time"] = gmr_time
-        output_data["gmr2true_W1"] = gmr2true_W1
-        output_data["gmr_ARI"] = gmr_ARI
-        # output_data["gmr"] = (gmr_means, gmr_covs, gmr_weights)
-        output_data["gmr_ll"] = gmr_ll
-        output_data["contam_label"] = contaminated_label
-        output_data["byzantine_machine"] = byzantine_machine_index
-
-        # ------------------------------
         # Trimmed k-barycenter with the 50% as the trimming level
         # ------------------------------
-        current_time = time.time()
-        model = GMR_PCTD(
-            np.concatenate(local_means),
-            np.concatenate(local_covs),
-            np.concatenate(local_weights) / n_split,
-            K,
-            ground_distance="KL",
-            init_method="user",
-            alpha=0.5,  # 50% trimming
-            means_init=coat_means,
-            covs_init=coat_covs,
-            weights_init=coat_weights,
-        )
-
-        model.iterative()
-        trim_time = time.time() - current_time
+        trim_gmr_optimal = np.Inf
+        for i in range(n_split):
+            model_temp = GMR_PCTD(
+                np.concatenate(local_means),
+                np.concatenate(local_covs),
+                np.concatenate(local_weights) / n_split,
+                K,
+                ground_distance="KL",
+                init_method="user",
+                alpha=0.5,  # 50% trimming
+                means_init=local_means[i],
+                covs_init=local_covs[i],
+                weights_init=local_weights[i],
+            )
+            model_temp.iterative()
+            if model_temp.obj < trim_gmr_optimal:
+                trim_gmr_optimal = model_temp.obj
+                model = model_temp
         trim_means, trim_covs, trim_weights = (
             model.reduced_means,
             model.reduced_covs,
@@ -400,46 +566,92 @@ def Simulation(inputs):
         trim_ARI = ARI(true_predicted_labels, trim_predicted_label)
         trim_ll = np.log(trim_resp.sum(1)).sum(0)
 
-        output_data["trim_time"] = trim_time
         output_data["trim2true_W1"] = trim2true_W1
         output_data["trim_ARI"] = trim_ARI
-        # output_data["trim"] = (
-        #     trim_means,
-        #     trim_covs,
-        #     trim_weights,
-        # )
         output_data["trim_ll"] = trim_ll
         output_data["trim_label"] = model.trimmed_label
 
         # ------------------------------
+        # GMR without trimming
+        # ------------------------------
+        gmr_optimal = np.Inf
+        for i in range(n_split):
+
+            reduced_gmm_temp = GMR_CTD(
+                np.concatenate(local_means),
+                np.concatenate(local_covs),
+                np.concatenate(local_weights) / n_split,
+                K,
+                ground_distance=ground_distance,
+                init_method="user",
+                means_init=coat_means,
+                covs_init=coat_covs,
+                weights_init=coat_weights,
+            )
+            reduced_gmm_temp.iterative()
+            if reduced_gmm_temp.obj < gmr_optimal:
+                gmr_optimal = reduced_gmm_temp.obj
+                reduced_gmm = reduced_gmm_temp
+        gmr_means, gmr_covs, gmr_weights = (
+            reduced_gmm.reduced_means,
+            reduced_gmm.reduced_covs,
+            reduced_gmm.reduced_weights,
+        )
+        gmr2true_W1 = GMM_CTD(
+            [gmr_means, true_means],
+            [gmr_covs, true_covs],
+            [gmr_weights, true_weights],
+            "W1",
+            False,
+        )
+        gmr_resp, gmr_predicted_label = label_predict(gmr_weights,
+                                                      gmr_means,
+                                                      gmr_covs,
+                                                      GMM_sample,
+                                                      return_resp=True)
+
+        gmr_ARI = ARI(true_predicted_labels, gmr_predicted_label)
+        gmr_ll = np.log(gmr_resp.sum(1)).sum(0)
+
+        # output_data["gmr_time"] = gmr_time
+        output_data["gmr2true_W1"] = gmr2true_W1
+        output_data["gmr_ARI"] = gmr_ARI
+        output_data["gmr_ll"] = gmr_ll
+        output_data["contam_label"] = contaminated_label
+        output_data["byzantine_machine"] = byzantine_machine_index
+
+        # ------------------------------
         # GMR + oracle weights
         # ------------------------------
-        oracle_trimmed_weights = np.concatenate([
-            local_weights[i] for i in range(n_split)
-            if i not in byzantine_machine_index
+        oracle_trimmed_weights = np.array([
+            local_weights[i][j] for i in range(n_split) for j in range(K)
+            if i not in byzantine_machine_index[j]
         ])
-        oracle_trimmed_weights /= int(n_split * (1 - failure_rate))
-
-        oracle = GMR_CTD(
-            np.concatenate([
-                local_means[i] for i in range(n_split)
-                if i not in byzantine_machine_index
-            ]),
-            np.concatenate([
-                local_covs[i] for i in range(n_split)
-                if i not in byzantine_machine_index
-            ]),
-            oracle_trimmed_weights,
-            K,
-            ground_distance=ground_distance,
-            init_method="user",
-            means_init=coat_means,
-            covs_init=coat_covs,
-            weights_init=coat_weights,
-        )
-        start_time = time.time()
-        oracle.iterative()
-        oracle_time = time.time() - start_time
+        oracle_trimmed_weights /= oracle_trimmed_weights.sum()
+        oracle_gmr_optimal = np.Inf
+        for i in range(n_split):
+            oracle_temp = GMR_CTD(
+                np.stack([
+                    local_means[i][j] for i in range(n_split) for j in range(K)
+                    if i not in byzantine_machine_index[j]
+                ]),
+                np.stack([
+                    local_covs[i][j] for i in range(n_split) for j in range(K)
+                    if i not in byzantine_machine_index[j]
+                ]),
+                oracle_trimmed_weights,
+                K,
+                ground_distance=ground_distance,
+                init_method="user",
+                means_init=local_means[i],
+                covs_init=local_covs[i],
+                weights_init=local_weights[i],
+            )
+            oracle_temp.iterative()
+            if oracle_temp.obj < oracle_gmr_optimal:
+                oracle_gmr_optimal = oracle_temp.obj
+                oracle = oracle_temp
+        # oracle_time = time.time() - start_time
         oracle_means, oracle_covs, oracle_weights = (
             oracle.reduced_means,
             oracle.reduced_covs,
@@ -463,14 +675,14 @@ def Simulation(inputs):
         oracle_ARI = ARI(true_predicted_labels, oracle_predicted_label)
         oracle_ll = np.log(oracle_resp.sum(1)).sum(0)
 
-        output_data["oracle_time"] = oracle_time
+        # output_data["oracle_time"] = oracle_time
         output_data["oracle2true_W1"] = oracle2true_W1
         output_data["oracle_ARI"] = oracle_ARI
-        # output_data["oracle"] = (
-        #     oracle_means,
-        #     oracle_covs,
-        #     oracle_weights,
-        # )
+        output_data["oracle"] = (
+            oracle_means,
+            oracle_covs,
+            oracle_weights,
+        )
         output_data["oracle_ll"] = oracle_ll
 
         for key, item in output_data.items():
@@ -482,7 +694,7 @@ def Simulation(inputs):
             "case_" + str(random_state) + "_nsplit_" + str(n_split) +
             "_ncomp_" + str(K) + "_d_" + str(D) + "_ss_" + str(sample_size) +
             "_failurerate_" + str(failure_rate) + "_attackmode_" +
-            str(attack_mode) + ".pickle",
+            str(attack_mode) + "_failuretype_" + str(failure_type) + ".pickle",
         )
 
         f = open(save_file, "wb")
@@ -490,7 +702,7 @@ def Simulation(inputs):
         f.close()
 
 
-def main(seed, sample_size, overlap, attack_mode, n_split):
+def main(seed, sample_size, overlap, attack_mode, n_split, failure_type):
     num_components = 5
     dimension = 10
 
@@ -526,6 +738,7 @@ def main(seed, sample_size, overlap, attack_mode, n_split):
         save_folder,
         attack_mode,
         n_split,
+        failure_type,
     ]
     Simulation(params)
 
@@ -555,6 +768,12 @@ if __name__ == "__main__":
         default=1,
         help="1:mean, 2:cov, 3:weight",
     )
+    parser.add_argument(
+        "--failure_type",
+        type=str,
+        default="machine",
+        help="component or machine",
+    )
 
     args = parser.parse_args()
     sample_size = int(args.ss)
@@ -562,9 +781,10 @@ if __name__ == "__main__":
     overlap = args.overlap
     attack_mode = args.attack_mode
     n_split = args.n_split
+    failure_type = args.failure_type
 
     save_folder = os.path.join("./output/save_data/", "ss_" + str(sample_size),
                                "overlap_" + str(overlap))
     if not os.path.exists(save_folder):
         os.makedirs(save_folder, exist_ok=True)
-    main(seed, sample_size, overlap, attack_mode, n_split)
+    main(seed, sample_size, overlap, attack_mode, n_split, failure_type)

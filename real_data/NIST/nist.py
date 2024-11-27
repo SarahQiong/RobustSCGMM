@@ -4,11 +4,20 @@ import time
 import pickle
 import argparse
 import numpy as np
+# from pmle_151 import pMLEGMM
 from pmle import pMLEGMM
 from CTDGMR.utils import *
 from CTDGMR.minCTD import *
 from CTDGMR.distance import GMM_CTD, GMM_L2
 from tqdm import tqdm
+
+
+def estimate_Gaussian(data):
+    n, d = data.shape
+    mean = data.mean(0)
+    diff = data - mean
+    cov = np.dot(diff.T, diff) / n + 1e-4 * np.eye(d)
+    return mean, cov
 
 
 def robustmedian(
@@ -28,61 +37,27 @@ def robustmedian(
                     [subset_covs[i], subset_covs[j]],
                     [subset_weights[i], subset_weights[j]],
                     ground_distance=ground_distance.split("-")[1],
-                    matrix=False,
-                )
+                    matrix=False)
             else:
-                pairwisedist[i, j] = GMM_L2(
-                    [subset_means[i], subset_means[j]],
-                    [subset_covs[i], subset_covs[j]],
-                    [subset_weights[i], subset_weights[j]],
-                )
+                pairwisedist[i, j] = np.sqrt(
+                    GMM_L2(
+                        [subset_means[i], subset_means[j]],
+                        [subset_covs[i], subset_covs[j]],
+                        [subset_weights[i], subset_weights[j]],
+                    ))
     which_GMM = np.argmin(np.quantile(pairwisedist, q=coverage_ratio, axis=1))
     output = [which_GMM, pairwisedist]
 
     return output
 
 
-# def ared_threshold(distance_to_center, pairwisedist, N, option=1):
-#     half_of_num_machine = int(distance_to_center.shape[0] // 2)
-#     indices = np.argsort(distance_to_center)
-#     sorted_distance = distance_to_center[indices]
-#     closest_indices = indices[:half_of_num_machine]
-
-#     if option == 1:
-#         c_sd = np.sum(
-#             distance_to_center[closest_indices]) / (2 * half_of_num_machine)
-#         threshold = 3
-#     elif option == 2:
-#         c_sd = np.sum(
-#             distance_to_center[closest_indices]) / (2 * half_of_num_machine)
-#         threshold = np.log(np.log(N))
-#     elif option == 3:
-#         rows, cols = np.ix_(closest_indices, closest_indices)
-#         c_sd = np.sum(pairwisedist[rows, cols]) / (2 * half_of_num_machine *
-#                                                    (half_of_num_machine - 1))
-#         threshold = 3
-#     elif option == 4:
-#         rows, cols = np.ix_(closest_indices, closest_indices)
-#         c_sd = np.sum(pairwisedist[rows, cols]) / (2 * half_of_num_machine *
-#                                                    (half_of_num_machine - 1))
-#         threshold = np.log(np.log(N))
-#     if np.sum(sorted_distance > threshold * c_sd) == 0:
-#         truncation = distance_to_center.shape[0]
-#     else:
-#         truncation = np.where(sorted_distance > threshold * c_sd)[0][0]
-
-#     return indices[:truncation]
-
-
-def ared_threshold(distance_to_center, pairwisedist, which_GMM):
+def ared_threshold(distance_to_center, pairwisedist, which_GMM, m):
     half_of_num_machine = int(distance_to_center.shape[0] // 2)
     indices = np.argsort(distance_to_center)
     sorted_distance = distance_to_center[indices]
-
-    threshold = np.log(distance_to_center.shape[0] / 2) * np.log(
-        np.log(distance_to_center.shape[0]))
-    c_sd = np.sort(pairwisedist[which_GMM])[half_of_num_machine] / 2
-    if np.sum(sorted_distance > threshold * c_sd) == 0:
+    c_sd = np.sort(pairwisedist[which_GMM])[half_of_num_machine]
+    threshold = np.sqrt(np.log(m / 2) * np.log(np.log(m)) * 2)
+    if (np.sum(sorted_distance > threshold * c_sd) == 0):
         truncation = distance_to_center.shape[0]
     else:
         truncation = np.where(sorted_distance > threshold * c_sd)[0][0]
@@ -90,12 +65,93 @@ def ared_threshold(distance_to_center, pairwisedist, which_GMM):
     return indices[:truncation]
 
 
+def ccred(means, covs, weights, means_init, covs_init, weights_init):
+    K, D = means_init.shape
+    n_split = means.shape[0] // K
+    cost_matrix = GMM_CTD(
+        means=[means, means_init],
+        covs=[covs, covs_init],
+        weights=[weights / n_split, weights_init],
+        ground_distance="KL",
+        matrix=True,
+    )
+    clustering_matrix = (cost_matrix.T == np.min(cost_matrix, 1)).T
+    ccred_means, ccred_covs, ccred_weights = np.zeros((K, D)), np.zeros(
+        (K, D, D)), np.zeros(K)
+    r_coats = 0
+    indice_lengths = []
+
+    for k in range(K):
+        group_means = means[clustering_matrix[:, k]]
+        group_covs = covs[clustering_matrix[:, k]]
+        local_closest_indices = np.argsort(cost_matrix[clustering_matrix[:, k],
+                                                       k])[:int(n_split // 2)]
+        r_coat = cost_matrix[clustering_matrix[:, k],
+                             k][local_closest_indices[-1]]
+        r_coats += r_coat
+        # print(k, local_closest_indices)
+        # indice_lengths.append(local_closest_indices.shape[0])
+        indice_lengths.append(local_closest_indices)
+        ccred_means[k], ccred_covs[k] = barycenter(
+            group_means[local_closest_indices],
+            group_covs[local_closest_indices],
+            weights[clustering_matrix[:, k]][local_closest_indices],
+            mean_init=means_init[k],
+            cov_init=means_init[k],
+            ground_distance="KL")
+        ccred_weights[k] = np.sum(
+            weights[clustering_matrix[:, k]][local_closest_indices])
+    ccred_weights /= ccred_weights.sum()
+
+    return ccred_means, ccred_covs, ccred_weights, r_coats, indice_lengths
+
+
+def cared(means, covs, weights, means_init, covs_init, weights_init):
+    K, D = means_init.shape
+    n_split = means.shape[0] / K
+    cost_matrix = GMM_CTD(
+        means=[means, means_init],
+        covs=[covs, covs_init],
+        weights=[weights / n_split, weights_init],
+        ground_distance="KL",
+        matrix=True,
+    )
+    clustering_matrix = (cost_matrix.T == np.min(cost_matrix, 1)).T
+    cared_means, cared_covs, cared_weights = np.zeros((K, D)), np.zeros(
+        (K, D, D)), np.zeros(K)
+
+    for k in range(K):
+        group_means = means[clustering_matrix[:, k]]
+        group_covs = covs[clustering_matrix[:, k]]
+        local_closest_indices = np.argsort(cost_matrix[clustering_matrix[:, k],
+                                                       k])[:int(n_split // 2)]
+        r_coat = cost_matrix[clustering_matrix[:, k],
+                             k][local_closest_indices[-1]]
+        a_coat = r_coat * np.sqrt(
+            np.log(n_split / 2) * np.log(np.log(n_split)) * 2)
+        local_closest_indices = np.where(cost_matrix[clustering_matrix[:, k],
+                                                     k] <= a_coat)
+        # only aggregate 50% for each component
+        cared_means[k], cared_covs[k] = barycenter(
+            group_means[local_closest_indices],
+            group_covs[local_closest_indices],
+            weights[clustering_matrix[:, k]][local_closest_indices],
+            mean_init=means_init[k],
+            cov_init=means_init[k],
+            ground_distance="KL")
+        cared_weights[k] = np.sum(
+            weights[clustering_matrix[:, k]][local_closest_indices])
+    cared_weights /= cared_weights.sum()
+
+    return cared_means, cared_covs, cared_weights
+
+
 # -------------------------------------------------------------------
 # split sample to different machines and fit mixture on each machine
 # -------------------------------------------------------------------
-def main(random_state, local_ss):
+def main(random_state, local_ss, failure_type):
 
-    n_split = 50
+    n_split = 30
     K, D = 10, 50
     np.random.seed(random_state)
     local_per_class = int(local_ss // n_split)
@@ -115,8 +171,8 @@ def main(random_state, local_ss):
     digits_test_label = np.load("preprocessed_data/NIST_label_digits_test.npy")
     letters_train = np.load(
         "preprocessed_data/NIST_feature_letters_train_50d.npy")
-    letters_train_label = np.load(
-        "preprocessed_data/NIST_label_letters_train.npy")
+    # letters_train_label = np.load(
+    #     "preprocessed_data/NIST_label_letters_train.npy")
 
     print(digits_train.shape, digits_test.shape, letters_train.shape)
 
@@ -129,8 +185,6 @@ def main(random_state, local_ss):
             local.append(digits_train[digits_train_label == i][(
                 split * local_per_class):((split + 1) * local_per_class)])
         local = np.vstack(local)
-        # local = digits_train[(split * local_ss):((split + 1) * local_ss)]
-        # print(local.shape)
         # random warm start first and then start from the true initial value
         gmmk = pMLEGMM(
             n_components=K,
@@ -146,20 +200,6 @@ def main(random_state, local_ss):
             # init_params="k-means++",
             warm_start=True,
         )
-        # gmmk = GaussianMixture(
-        #     n_components=K,
-        #     covariance_type="full",
-        #     max_iter=10000,
-        #     reg_covar=1.0 / np.sqrt(local.shape[0]),
-        #     n_init=10,
-        #     tol=1e-10,
-        #     random_state=10,
-        #     verbose=0,
-        #     verbose_interval=1,
-        #     init_params="k-means++",
-        #     warm_start=True,
-        # )
-
         start_time = time.time()
         gmmk.fit(local)
         gmmk.max_iter = 10000
@@ -216,7 +256,6 @@ def main(random_state, local_ss):
 
     # for failure_rate in [0.1]:
     for failure_rate in tqdm([0.0, 0.1, 0.2, 0.3, 0.4]):
-        # for failure_rate in [0.0]:
         if failure_rate != 0:
             # Load local estimates
             save_folder = 'Local'
@@ -233,33 +272,25 @@ def main(random_state, local_ss):
             local_ARI = output_data["local_ARI"]
             local_ll = output_data["local_ll"]
 
-            # generate Byzantine failure index
-
-            byzantine_machine_index = np.random.choice(n_split,
-                                                       int(n_split *
-                                                           failure_rate),
-                                                       replace=False)
-            print(byzantine_machine_index)
-            for b_index in byzantine_machine_index:
-                local = letters_train[np.random.choice(letters_train.shape[0],
-                                                       local_ss,
-                                                       replace=False)]
-                # local = []
-                # for i in range(10):
-                #     ith_letter = letters_train[letters_train_label == i]
-
-                #     local.append(ith_letter[np.random.choice(
-                #         ith_letter.shape[0], local_per_class, replace=False)])
-                # local.append(letters_train[letters_train_label == i][(
-                #     b_index * local_per_class):((b_index + 1) *
-                #                                 local_per_class)])
-                # local = np.vstack(local)
-                # local = letters_train[letters_train_label == b_index][:local_ss]
-                # random warm start first and then start from the true initial value
+            #------------------------------------
+            # generate Byzantine failure
+            #------------------------------------
+            if failure_type == "machine":
+                rng = np.random.default_rng(random_state)
+                byzantine_machine_index = rng.choice(n_split,
+                                                     int(n_split *
+                                                         failure_rate),
+                                                     replace=False)
+                for b_index in byzantine_machine_index:
+                    local = letters_train[rng.choice(letters_train.shape[0],
+                                                     local_ss,
+                                                     replace=False)]
+                failure_indices = []
+                for k in range(K):
+                    failure_indices.append(byzantine_machine_index)
                 gmmk = pMLEGMM(
                     n_components=K,
                     cov_reg=1.0 / np.sqrt(local.shape[0]),
-                    # cov_reg=1.0 / local.shape[0],
                     covariance_type="full",
                     max_iter=50,
                     n_init=10,
@@ -267,22 +298,8 @@ def main(random_state, local_ss):
                     random_state=10,
                     verbose=0,
                     verbose_interval=1,
-                    # init_params="k-means++",
                     warm_start=True,
                 )
-                # gmmk = GaussianMixture(
-                #     n_components=K,
-                #     covariance_type="full",
-                #     max_iter=10000,
-                #     reg_covar=1.0 / np.sqrt(local.shape[0]),
-                #     n_init=10,
-                #     tol=1e-10,
-                #     random_state=10,
-                #     verbose=0,
-                #     verbose_interval=1,
-                #     init_params="k-means++",
-                #     warm_start=True,
-                # )
                 start_time = time.time()
                 gmmk.fit(local)
                 gmmk.max_iter = 10000
@@ -306,12 +323,66 @@ def main(random_state, local_ss):
                 local_ARI[b_index] = ARI(digits_test_label,
                                          local_predicted_label)
                 local_ll[b_index] = np.log(local_resp.sum(1)).sum(0)
+                # local = []
+                # for i in range(10):
+                #     ith_letter = letters_train[letters_train_label == i]
+
+                #     local.append(ith_letter[np.random.choice(
+                #         ith_letter.shape[0], local_per_class, replace=False)])
+                # local.append(letters_train[letters_train_label == i][(
+                #     b_index * local_per_class):((b_index + 1) *
+                #                                 local_per_class)])
+                # local = np.vstack(local)
+                # local = letters_train[letters_train_label == b_index][:local_ss]
+                # random warm start first and then start from the true initial value
+            elif failure_type == "component":
+                contaminated_label = [np.zeros(K) for _ in range(n_split)]
+                per_comp_failure_num = int(np.floor(failure_rate * n_split))
+                rng = np.random.default_rng(random_state)
+                failure_indices = []
+                for k in range(K):
+                    # randomly select the Byzantine failure components
+                    # The last machine is always Byzantine failure free
+                    failure_index = rng.choice(n_split - 1,
+                                               per_comp_failure_num,
+                                               replace=False)
+                    # print(k, failure_index)
+                    failure_indices.append(failure_index)
+                    # generate attacks
+                    for idx in failure_index:
+                        # local_data = letters_train[letters_train_label == k]
+                        local_mean, local_cov = estimate_Gaussian(
+                            letters_train[rng.choice(letters_train.shape[0],
+                                                     100,
+                                                     replace=False)])
+                        # local_data[rng.choice(local_data.shape[0],
+                        #                       int(local_weights[idx][k] *
+                        #                           local_ss),
+                        #                       replace=False)])
+                        local_means[idx][k] = copy.deepcopy(local_mean)
+                        local_covs[idx][k] = copy.deepcopy(local_cov)
+                        contaminated_label[idx][k] = 1
+                for i in range(n_split):
+                    local_resp, local_predicted_label = label_predict(
+                        local_weights[i],
+                        local_means[i],
+                        local_covs[i],
+                        digits_test,
+                        return_resp=True,
+                    )
+                    local_ARI[i] = ARI(digits_test_label,
+                                       local_predicted_label)
+                    local_ll[i] = np.log(local_resp.sum(1)).sum(0)
+
+            else:
+                raise ValueError("This failure type is not implemented!")
 
             save_file = os.path.join(
                 save_folder,
                 "case_" + str(random_state) + "_nsplit_" + str(n_split) +
                 "_ncomp_" + str(K) + "_d_" + str(D) + "_ss_" + str(local_ss) +
-                "_failuretate_" + str(failure_rate) + ".pickle",
+                "_failuretate_" + str(failure_rate) + "_failuretype_" +
+                str(failure_type) + ".pickle",
             )
 
             output_data = {
@@ -319,21 +390,33 @@ def main(random_state, local_ss):
                 "local": (local_means, local_covs, local_weights),
                 "local_ll": local_ll,
             }
-            # for local_pmle_covs in local_covs:
-            #     for i, cov in enumerate(local_pmle_covs):
-            #         eigvals = np.linalg.eigvals(cov)
-            #         print(i, eigvals.min(), eigvals.max())
-
             f = open(save_file, "wb")
             pickle.dump(output_data, f)
             f.close()
 
         else:
             byzantine_machine_index = []
+            contaminated_label = []
+            failure_indices = [[] for _ in range(n_split)]
 
         output_data = {}
-        output_data["byzantine_machine"] = byzantine_machine_index
+        if failure_type == "machine":
+            output_data["byzantine_machine"] = byzantine_machine_index
+        elif failure_type == "component":
+            output_data["contaminated_label"] = contaminated_label
 
+        # mycost = GMM_CTD(
+        #     means=[np.concatenate(local_means),
+        #            np.concatenate(local_means)],
+        #     covs=[np.concatenate(local_covs),
+        #           np.concatenate(local_covs)],
+        #     weights=[
+        #         np.concatenate(local_weights) / n_split,
+        #         np.concatenate(local_weights) / n_split
+        #     ],
+        #     ground_distance="KL",
+        #     matrix=True,
+        # )
         # ------------------------------
         # COAT
         # ------------------------------
@@ -343,12 +426,9 @@ def main(random_state, local_ss):
             local_covs,
             local_weights,
             ground_distance="CTD-KL",
-            # ground_distance="L2",
             coverage_ratio=0.5,
         )
         coat_time = time.time() - start_time
-
-        # print(pairwisedist)
 
         output_data["coat_coat"] = coat_time
         output_data["coat_index"] = which_GMM
@@ -362,7 +442,7 @@ def main(random_state, local_ss):
         )
 
         # ------------------------------
-        # GMR using 50% around COAT
+        # CRED
         # ------------------------------
         start_time = time.time()
         closest_indices = np.argsort(pairwisedist[which_GMM])[:int(n_split //
@@ -406,19 +486,13 @@ def main(random_state, local_ss):
         output_data["cred_ll"] = cred_ll
 
         # ------------------------------
-        # GMR by Thresholding (option1)
+        # ARED
         # ------------------------------
         start_time = time.time()
         distance_to_center = pairwisedist[which_GMM]
-
-        # ared_untruncated_indices = ared_threshold(distance_to_center,
-        #                                           pairwisedist,
-        #                                           local_ss * n_split,
-        #                                           option=3)
         ared_untruncated_indices = ared_threshold(distance_to_center,
-                                                  pairwisedist, which_GMM)
-        # breakpoint()
-
+                                                  pairwisedist, which_GMM,
+                                                  n_split)
         model = GMR_CTD(
             np.concatenate(
                 [local_means[index] for index in ared_untruncated_indices]),
@@ -464,7 +538,83 @@ def main(random_state, local_ss):
         output_data["ared_trimmed"] = ared_untruncated_indices
 
         # ------------------------------
-        # GMR without trimming
+        # CCRED
+        # ------------------------------
+        start_time = time.time()
+        optimal_rcoat = np.Inf
+
+        for i in range(n_split):
+            temp_means, temp_covs, temp_weights, r_coats, single_cluster = ccred(
+                np.concatenate(local_means),
+                np.concatenate(local_covs),
+                np.concatenate(local_weights),
+                local_means[i],
+                local_covs[i],
+                local_weights[i],
+            )
+            if r_coats < optimal_rcoat and (1 not in [
+                    i.shape[0] for i in single_cluster
+            ]):
+                optimal_rcoat = r_coats
+                ccred_means = temp_means
+                ccred_covs = temp_covs
+                ccred_weights = temp_weights
+                optimal_rcoat_machine = i
+        ccred_time = time.time() - start_time
+
+        # print(optimal_rcoat_machine, single_cluster)
+
+        ccred_resp, ccred_predicted_label = label_predict(
+            ccred_weights,
+            ccred_means,
+            ccred_covs,
+            digits_test,
+            return_resp=True,
+        )
+
+        ccred_ARI = ARI(digits_test_label, ccred_predicted_label)
+        ccred_ll = np.log(ccred_resp.sum(1)).sum(0)
+
+        output_data["ccred_time"] = ccred_time
+        output_data["ccred_ARI"] = ccred_ARI
+        output_data["ccred"] = (ccred_means, ccred_covs, ccred_weights)
+        output_data["ccred_ll"] = ccred_ll
+
+        # ------------------------------
+        # CARED
+        # ------------------------------
+        start_time = time.time()
+        cared_means, cared_covs, cared_weights = cared(
+            np.concatenate(local_means),
+            np.concatenate(local_covs),
+            np.concatenate(local_weights),
+            local_means[optimal_rcoat_machine],
+            local_covs[optimal_rcoat_machine],
+            local_weights[optimal_rcoat_machine],
+        )
+        cared_time = time.time() - start_time
+
+        cared_resp, cared_predicted_label = label_predict(
+            cared_weights,
+            cared_means,
+            cared_covs,
+            digits_test,
+            return_resp=True,
+        )
+
+        cared_ARI = ARI(digits_test_label, cared_predicted_label)
+        cared_ll = np.log(cared_resp.sum(1)).sum(0)
+
+        output_data["cred_time"] = cared_time
+        output_data["cared_ARI"] = cared_ARI
+        output_data["cared"] = (
+            cared_means,
+            cared_covs,
+            cared_weights,
+        )
+        output_data["cared_ll"] = cared_ll
+        # ------------------------------
+        # GMR
         # ------------------------------
         start_time = time.time()
         reduced_gmm = GMR_CTD(
@@ -545,20 +695,20 @@ def main(random_state, local_ss):
         # ------------------------------
         # GMR + oracle weights
         # ------------------------------
-        oracle_trimmed_weights = np.concatenate([
-            local_weights[i] for i in range(n_split)
-            if i not in byzantine_machine_index
+        oracle_trimmed_weights = np.array([
+            local_weights[i][j] for i in range(n_split) for j in range(K)
+            if i not in failure_indices[j]
         ])
-        oracle_trimmed_weights /= int(n_split * (1 - failure_rate))
+        oracle_trimmed_weights /= oracle_trimmed_weights.sum()
 
         oracle = GMR_CTD(
-            np.concatenate([
-                local_means[i] for i in range(n_split)
-                if i not in byzantine_machine_index
+            np.stack([
+                local_means[i][j] for i in range(n_split) for j in range(K)
+                if i not in failure_indices[j]
             ]),
-            np.concatenate([
-                local_covs[i] for i in range(n_split)
-                if i not in byzantine_machine_index
+            np.stack([
+                local_covs[i][j] for i in range(n_split) for j in range(K)
+                if i not in failure_indices[j]
             ]),
             oracle_trimmed_weights,
             K,
@@ -611,7 +761,8 @@ def main(random_state, local_ss):
             save_folder,
             "case_" + str(random_state) + "_nsplit_" + str(n_split) +
             "_ncomp_" + str(K) + "_d_" + str(D) + "_ss_" + str(local_ss) +
-            "_failurerate_" + str(failure_rate) + ".pickle",
+            "_failurerate_" + str(failure_rate) + "_failuretype_" +
+            str(failure_type) + ".pickle",
         )
 
         f = open(save_file, "wb")
@@ -630,9 +781,14 @@ if __name__ == "__main__":
                         type=int,
                         default=30000,
                         help="Total sample size from a GMM")
+    parser.add_argument("--failure_type",
+                        type=str,
+                        default='machine',
+                        help="Failure type: machine or component")
 
     args = parser.parse_args()
     local_ss = int(args.local_ss)
     seed = args.seed
+    failure_type = args.failure_type
 
-    main(seed, local_ss)
+    main(seed, local_ss, failure_type)
