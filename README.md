@@ -31,11 +31,6 @@ cd simulation
 python global_local.py --ss 100000 --seed 1 --overlap 0.1 --n_split 20 
 python simulation.py --ss 100000 --seed 1 --attack_mode 3 --overlap 0.1 --n_split 20
 ```
-If you want to run the experiment for component-wise failure, you can run the following
-```
-python simulation.py --ss 100000 --seed 1 --attack_mode 1 --overlap 0.1 --n_split 100 --failure_type component
-```
-
 
 The output will be stored in a pickle file under output/save_data directory.
 Then you can load the pickle file to post-process the simulation results.
@@ -50,8 +45,4 @@ The NIST folder contains the code for our experiment.
 To run an experiment, you can simply run 
 ```
 python nist.py --local_ss 5000 --seed 1
-```
-Similarly, you can run the code for component-wise failure as follows:
-```
-python nist.py --local_ss 5000 --seed 1 --n_split 20
 ```

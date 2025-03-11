@@ -195,8 +195,6 @@ def main(seed, sample_size, overlap, n_split):
     # fix the number of components to be 5
     num_components = 5
     dimension = 10
-    # num_components = 3
-    # dimension = 2
 
     base_dir = "./generated_pop/true_param"
     true_weights = np.loadtxt(
